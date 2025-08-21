@@ -190,7 +190,7 @@ fn test_glue_validate() {
         .arg("validate")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Platform 'nrf52' valid"));
+        .stdout(predicate::str::contains("Validating platform 'nrf52'"));
 }
 
 /// Test that workspace Cargo.toml is properly updated
@@ -295,6 +295,48 @@ fn test_desktop_target_standard_setup() {
     
     assert!(!main_content.contains("#![no_std]"), "Desktop main should have std");
     assert!(main_content.contains("fn main()"), "Desktop should have standard main");
+}
+
+/// Test glue configuration management commands
+#[test]
+fn test_glue_commands() {
+    let temp = TempDir::new().unwrap();
+    let mut cmd = Command::cargo_bin("multi-target-rs").unwrap();
+    
+    // First init project
+    cmd.current_dir(&temp)
+        .arg("init")
+        .arg("testproj")
+        .assert()
+        .success();
+    
+    // Test glue list on empty project
+    let mut cmd = Command::cargo_bin("multi-target-rs").unwrap();
+    cmd.current_dir(temp.path().join("testproj"))
+        .arg("glue")
+        .arg("list")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No platforms configured"));
+    
+    // Test glue validate on empty project
+    let mut cmd = Command::cargo_bin("multi-target-rs").unwrap();
+    cmd.current_dir(temp.path().join("testproj"))
+        .arg("glue")
+        .arg("validate")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Validation complete"));
+    
+    // Test glue init with invalid URL (should fail gracefully)
+    let mut cmd = Command::cargo_bin("multi-target-rs").unwrap();
+    cmd.current_dir(temp.path().join("testproj"))
+        .arg("glue")
+        .arg("init")
+        .arg("testplatform")
+        .arg("https://github.com/nonexistent/repo")
+        .assert()
+        .failure(); // Should fail but not crash
 }
 
 /// Functional requirement test: Complete workflow

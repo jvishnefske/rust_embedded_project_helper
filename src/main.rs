@@ -62,13 +62,28 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum GlueCommands {
-    /// Add a new glue configuration
+    /// Initialize glue configuration from URL or crate
+    Init {
+        /// Platform name
+        platform: String,
+        /// Repository URL or crate name
+        source: String,
+        /// Optional target triple override
+        #[arg(long)]
+        target: Option<String>,
+    },
+    /// Add a new glue configuration manually
     Add {
         platform: String,
         config_name: String,
     },
     /// List glue configurations
     List,
+    /// Remove a glue configuration
+    Remove {
+        /// Platform name to remove
+        platform: String,
+    },
     /// Validate glue configurations
     Validate,
 }
@@ -87,6 +102,25 @@ struct Platform {
     hal_crate: Option<String>,
     linker_script: Option<String>,
     features: Vec<String>,
+    hal_info: Option<HalInfo>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct HalInfo {
+    source: String, // URL or crate name
+    version: Option<String>,
+    provided_traits: Vec<TraitInfo>,
+    required_traits: Vec<String>,
+    mocked_traits: Vec<String>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct TraitInfo {
+    name: String,
+    module: String,
+    implemented_types: Vec<String>,
+    native_mockable: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -108,6 +142,226 @@ impl BuildTool {
             BuildTool::Cross => "cross",
         }
     }
+}
+
+// Package inspection and analysis
+struct PackageInspector {
+    client: reqwest::Client,
+}
+
+impl PackageInspector {
+    fn new() -> Self {
+        Self {
+            client: reqwest::Client::new(),
+        }
+    }
+
+    async fn inspect_from_url(&self, url: &str) -> Result<HalInfo, anyhow::Error> {
+        println!("🔍 Inspecting package from URL: {}", url);
+        
+        // Extract GitHub info from URL
+        let github_info = self.parse_github_url(url)?;
+        
+        // Fetch Cargo.toml
+        let cargo_toml = self.fetch_cargo_toml(&github_info).await?;
+        
+        // Fetch and analyze source files
+        let trait_info = self.analyze_source_files(&github_info).await?;
+        
+        // Check for native compatibility
+        let (mocked_traits, warnings) = self.check_native_compatibility(&trait_info);
+        
+        Ok(HalInfo {
+            source: url.to_string(),
+            version: cargo_toml.get("version").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            provided_traits: trait_info,
+            required_traits: self.extract_required_traits(&cargo_toml),
+            mocked_traits,
+            warnings,
+        })
+    }
+
+    fn parse_github_url(&self, url: &str) -> Result<GitHubInfo, anyhow::Error> {
+        let re = regex::Regex::new(r"https://github\.com/([^/]+)/([^/]+)")?;
+        if let Some(captures) = re.captures(url) {
+            Ok(GitHubInfo {
+                owner: captures[1].to_string(),
+                repo: captures[2].to_string(),
+            })
+        } else {
+            Err(anyhow::anyhow!("Invalid GitHub URL format"))
+        }
+    }
+
+    async fn fetch_cargo_toml(&self, info: &GitHubInfo) -> Result<toml::Value, anyhow::Error> {
+        // Try multiple possible branch names
+        let branches = ["main", "master"];
+        
+        for branch in &branches {
+            let url = format!(
+                "https://raw.githubusercontent.com/{}/{}/{}/Cargo.toml",
+                info.owner, info.repo, branch
+            );
+            
+            println!("📦 Trying to fetch Cargo.toml from {}", url);
+            if let Ok(response) = self.client.get(&url).send().await {
+                if response.status().is_success() {
+                    let content = response.text().await?;
+                    return Ok(toml::from_str(&content)?);
+                }
+            }
+        }
+        
+        Err(anyhow::anyhow!("Could not fetch Cargo.toml from repository. Tried branches: {}", branches.join(", ")))
+    }
+
+    async fn analyze_source_files(&self, info: &GitHubInfo) -> Result<Vec<TraitInfo>, anyhow::Error> {
+        println!("🔬 Analyzing source files for traits...");
+        
+        let mut traits = Vec::new();
+        let branches = ["main", "master"];
+        
+        // Try to fetch lib.rs from different branches
+        for branch in &branches {
+            let lib_url = format!(
+                "https://raw.githubusercontent.com/{}/{}/{}/src/lib.rs",
+                info.owner, info.repo, branch
+            );
+            
+            if let Ok(response) = self.client.get(&lib_url).send().await {
+                if response.status().is_success() {
+                    if let Ok(content) = response.text().await {
+                        println!("📄 Analyzing lib.rs from {} branch", branch);
+                        traits.extend(self.parse_traits_from_rust_code(&content, "lib")?);
+                        break; // Found working branch, stop trying
+                    }
+                }
+            }
+        }
+        
+        // For a real implementation, we'd also fetch other .rs files
+        // This is a simplified version that analyzes just lib.rs
+        
+        Ok(traits)
+    }
+
+    fn parse_traits_from_rust_code(&self, code: &str, module: &str) -> Result<Vec<TraitInfo>, anyhow::Error> {
+        let mut traits = Vec::new();
+        
+        // Parse the Rust code using syn
+        if let Ok(file) = syn::parse_file(code) {
+            for item in file.items {
+                match item {
+                    syn::Item::Trait(trait_item) => {
+                        let trait_name = trait_item.ident.to_string();
+                        
+                        // Check if this trait is native mockable
+                        let native_mockable = self.is_trait_native_mockable(&trait_name);
+                        
+                        traits.push(TraitInfo {
+                            name: trait_name,
+                            module: module.to_string(),
+                            implemented_types: Vec::new(), // Would need more analysis to fill this
+                            native_mockable,
+                        });
+                    }
+                    syn::Item::Impl(impl_item) => {
+                        if let Some((_, trait_path, _)) = &impl_item.trait_ {
+                            if let Some(trait_name) = self.extract_trait_name_from_path(trait_path) {
+                                let native_mockable = self.is_trait_native_mockable(&trait_name);
+                                
+                                // Check if we already have this trait
+                                if let Some(existing) = traits.iter_mut().find(|t| t.name == trait_name) {
+                                    // Add implemented type
+                                    if let syn::Type::Path(type_path) = &*impl_item.self_ty {
+                                        if let Some(type_name) = type_path.path.segments.last() {
+                                            existing.implemented_types.push(type_name.ident.to_string());
+                                        }
+                                    }
+                                } else {
+                                    // Add new trait entry
+                                    let mut implemented_types = Vec::new();
+                                    if let syn::Type::Path(type_path) = &*impl_item.self_ty {
+                                        if let Some(type_name) = type_path.path.segments.last() {
+                                            implemented_types.push(type_name.ident.to_string());
+                                        }
+                                    }
+                                    
+                                    traits.push(TraitInfo {
+                                        name: trait_name,
+                                        module: module.to_string(),
+                                        implemented_types,
+                                        native_mockable,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    _ => {} // Ignore other items
+                }
+            }
+        }
+        
+        Ok(traits)
+    }
+
+    fn extract_trait_name_from_path(&self, path: &syn::Path) -> Option<String> {
+        if let Some(segment) = path.segments.last() {
+            Some(segment.ident.to_string())
+        } else {
+            None
+        }
+    }
+
+    fn is_trait_native_mockable(&self, trait_name: &str) -> bool {
+        // Known traits that can be mocked on native platforms
+        let mockable_traits = [
+            "OutputPin", "InputPin", "Read", "Write", "Spi", "I2c", 
+            "Delay", "Timer", "Pwm", "Adc", "Dac", "Serial", "SpiDevice",
+            "DelayNs", "DelayMs", "DelayUs",
+        ];
+        
+        mockable_traits.contains(&trait_name)
+    }
+
+    fn extract_required_traits(&self, cargo_toml: &toml::Value) -> Vec<String> {
+        let mut required = Vec::new();
+        
+        // Look for embedded-hal dependencies
+        if let Some(deps) = cargo_toml.get("dependencies").and_then(|d| d.as_table()) {
+            for (name, _) in deps {
+                if name.contains("embedded-hal") {
+                    required.push(name.clone());
+                }
+            }
+        }
+        
+        required
+    }
+
+    fn check_native_compatibility(&self, traits: &[TraitInfo]) -> (Vec<String>, Vec<String>) {
+        let mut mocked = Vec::new();
+        let mut warnings = Vec::new();
+        
+        for trait_info in traits {
+            if trait_info.native_mockable {
+                mocked.push(trait_info.name.clone());
+            } else {
+                warnings.push(format!(
+                    "Trait '{}' may not be available for native testing", 
+                    trait_info.name
+                ));
+            }
+        }
+        
+        (mocked, warnings)
+    }
+}
+
+#[derive(Debug)]
+struct GitHubInfo {
+    owner: String,
+    repo: String,
 }
 
 // Main application structure
@@ -808,6 +1062,7 @@ fn main() -> ! {{
             hal_crate: hal,
             linker_script: None,
             features: vec![],
+            hal_info: None,
         });
         
         let content = toml::to_string_pretty(&config)?;
@@ -972,52 +1227,244 @@ fn main() -> ! {{
     }
 
     // Glue configuration management
-    fn handle_glue_command(&self, cmd: GlueCommands) -> Result<(), Box<dyn std::error::Error>> {
+    async fn handle_glue_command(&self, cmd: GlueCommands) -> Result<(), anyhow::Error> {
         match cmd {
+            GlueCommands::Init { platform, source, target } => {
+                self.init_glue_from_source(platform, source, target).await
+            }
             GlueCommands::Add { platform, config_name } => {
                 println!("Adding glue config '{}' for platform '{}'", config_name, platform);
                 // Implementation would add board-specific configurations
                 Ok(())
             }
             GlueCommands::List => {
-                self.list_platforms()?;
-                Ok(())
+                self.list_glue_configs()
+            }
+            GlueCommands::Remove { platform } => {
+                self.remove_glue_config(platform)
             }
             GlueCommands::Validate => {
-                println!("Validating glue configurations...");
-                let glue_path = self.project_root.join("glue.toml");
-                
-                if !glue_path.exists() {
-                    println!("No glue.toml found");
-                    return Ok(());
-                }
-                
-                let content = fs::read_to_string(&glue_path)?;
-                let config: GlueConfig = toml::from_str(&content)?;
-                
-                for platform in &config.platforms {
-                    println!("  ✓ Platform '{}' valid", platform.name);
-                    
-                    // Check if referenced crates exist
-                    let hal_path = self.project_root.join(format!("hal-{}", platform.name));
-                    let app_path = self.project_root.join(format!("app-{}", platform.name));
-                    
-                    if !hal_path.exists() {
-                        println!("    ⚠ Warning: hal-{} directory not found", platform.name);
-                    }
-                    if !app_path.exists() {
-                        println!("    ⚠ Warning: app-{} directory not found", platform.name);
-                    }
-                }
-                
-                println!("✅ Validation complete");
-                Ok(())
+                self.validate_glue_configs()
             }
         }
     }
+
+    async fn init_glue_from_source(&self, platform: String, source: String, target: Option<String>) -> Result<(), anyhow::Error> {
+        println!("🚀 Initializing glue configuration for platform '{}'", platform);
+        
+        let inspector = PackageInspector::new();
+        let hal_info = if source.starts_with("http") {
+            inspector.inspect_from_url(&source).await?
+        } else {
+            return Err(anyhow::anyhow!("Crate name inspection not yet implemented. Please use GitHub URL."));
+        };
+
+        // Display discovered information
+        println!("\n📊 Package Analysis Results:");
+        println!("  Source: {}", hal_info.source);
+        if let Some(version) = &hal_info.version {
+            println!("  Version: {}", version);
+        }
+        
+        println!("  📦 Found {} traits:", hal_info.provided_traits.len());
+        for trait_info in &hal_info.provided_traits {
+            let mockable_indicator = if trait_info.native_mockable { "✅" } else { "⚠️" };
+            println!("    {} {} (module: {})", mockable_indicator, trait_info.name, trait_info.module);
+            if !trait_info.implemented_types.is_empty() {
+                println!("      Types: {}", trait_info.implemented_types.join(", "));
+            }
+        }
+
+        if !hal_info.mocked_traits.is_empty() {
+            println!("  🧪 Native mockable traits: {}", hal_info.mocked_traits.join(", "));
+        }
+
+        if !hal_info.warnings.is_empty() {
+            println!("  ⚠️  Warnings:");
+            for warning in &hal_info.warnings {
+                println!("    - {}", warning);
+            }
+        }
+
+        // Determine target if not provided
+        let final_target = target.unwrap_or_else(|| {
+            // Try to infer from repository name
+            if source.contains("stm32") {
+                "thumbv7em-none-eabi".to_string()
+            } else if source.contains("esp32") {
+                "xtensa-esp32-none-elf".to_string()
+            } else {
+                println!("⚠️  Could not infer target triple. Please specify with --target");
+                "unknown".to_string()
+            }
+        });
+
+        // Update glue configuration
+        let glue_path = self.project_root.join("glue.toml");
+        let mut config: GlueConfig = if glue_path.exists() {
+            let content = fs::read_to_string(&glue_path)?;
+            toml::from_str(&content)?
+        } else {
+            GlueConfig { platforms: vec![], build_config: None }
+        };
+
+        // Check if platform already exists
+        if let Some(existing) = config.platforms.iter_mut().find(|p| p.name == platform) {
+            existing.hal_info = Some(hal_info);
+            existing.target = final_target;
+            println!("  ✓ Updated existing platform configuration");
+        } else {
+            // Extract crate name from source
+            let hal_crate = if let Some(captures) = regex::Regex::new(r"/([^/]+)$")?.captures(&source) {
+                Some(captures[1].to_string())
+            } else {
+                None
+            };
+
+            config.platforms.push(Platform {
+                name: platform.clone(),
+                target: final_target,
+                hal_crate,
+                linker_script: None,
+                features: vec![],
+                hal_info: Some(hal_info),
+            });
+            println!("  ✓ Added new platform configuration");
+        }
+
+        // Save updated configuration
+        let content = toml::to_string_pretty(&config)?;
+        fs::write(&glue_path, content)?;
+        
+        println!("✅ Glue configuration saved to glue.toml");
+        println!("\nNext steps:");
+        println!("  1. Run: multi-target-rs add-platform {} --target {}", platform, config.platforms.last().unwrap().target);
+        println!("  2. Run: multi-target-rs build --target {}", platform);
+        
+        Ok(())
+    }
+
+    fn list_glue_configs(&self) -> Result<(), anyhow::Error> {
+        let glue_path = self.project_root.join("glue.toml");
+        
+        if !glue_path.exists() {
+            println!("No glue configurations found. Use 'glue init' to create one.");
+            return Ok(());
+        }
+
+        let content = fs::read_to_string(&glue_path)?;
+        let config: GlueConfig = toml::from_str(&content)?;
+        
+        if config.platforms.is_empty() {
+            println!("No platforms configured.");
+        } else {
+            println!("📋 Configured platforms:");
+            for platform in &config.platforms {
+                println!("\n  🔧 {} ({})", platform.name, platform.target);
+                
+                if let Some(hal_crate) = &platform.hal_crate {
+                    println!("    HAL: {}", hal_crate);
+                }
+                
+                if let Some(hal_info) = &platform.hal_info {
+                    println!("    Source: {}", hal_info.source);
+                    if let Some(version) = &hal_info.version {
+                        println!("    Version: {}", version);
+                    }
+                    println!("    Traits: {} ({}  mockable)", 
+                            hal_info.provided_traits.len(),
+                            hal_info.mocked_traits.len());
+                    
+                    if !hal_info.warnings.is_empty() {
+                        println!("    ⚠️  {} warnings", hal_info.warnings.len());
+                    }
+                }
+            }
+        }
+        
+        Ok(())
+    }
+
+    fn remove_glue_config(&self, platform: String) -> Result<(), anyhow::Error> {
+        let glue_path = self.project_root.join("glue.toml");
+        
+        if !glue_path.exists() {
+            println!("No glue.toml found");
+            return Ok(());
+        }
+
+        let content = fs::read_to_string(&glue_path)?;
+        let mut config: GlueConfig = toml::from_str(&content)?;
+        
+        let original_len = config.platforms.len();
+        config.platforms.retain(|p| p.name != platform);
+        
+        if config.platforms.len() < original_len {
+            let content = toml::to_string_pretty(&config)?;
+            fs::write(&glue_path, content)?;
+            println!("✅ Removed platform '{}' from glue configuration", platform);
+        } else {
+            println!("❌ Platform '{}' not found in configuration", platform);
+        }
+        
+        Ok(())
+    }
+
+    fn validate_glue_configs(&self) -> Result<(), anyhow::Error> {
+        println!("🔍 Validating glue configurations...");
+        let glue_path = self.project_root.join("glue.toml");
+        
+        if !glue_path.exists() {
+            println!("No glue.toml found");
+            return Ok(());
+        }
+        
+        let content = fs::read_to_string(&glue_path)?;
+        let config: GlueConfig = toml::from_str(&content)?;
+        
+        for platform in &config.platforms {
+            println!("  🔧 Validating platform '{}'", platform.name);
+            
+            // Check if referenced crates exist
+            let hal_path = self.project_root.join(format!("hal-{}", platform.name));
+            let app_path = self.project_root.join(format!("app-{}", platform.name));
+            
+            if !hal_path.exists() {
+                println!("    ⚠️  Warning: hal-{} directory not found", platform.name);
+            } else {
+                println!("    ✅ HAL crate exists");
+            }
+            
+            if !app_path.exists() {
+                println!("    ⚠️  Warning: app-{} directory not found", platform.name);
+            } else {
+                println!("    ✅ App crate exists");
+            }
+
+            // Validate HAL info if present
+            if let Some(hal_info) = &platform.hal_info {
+                println!("    📊 HAL Analysis:");
+                println!("      - {} traits analyzed", hal_info.provided_traits.len());
+                println!("      - {} traits mockable on native", hal_info.mocked_traits.len());
+                
+                if !hal_info.warnings.is_empty() {
+                    println!("      - {} compatibility warnings", hal_info.warnings.len());
+                    for warning in &hal_info.warnings {
+                        println!("        ⚠️  {}", warning);
+                    }
+                }
+            } else {
+                println!("    ℹ️  No HAL analysis available. Run 'glue init' to analyze.");
+            }
+        }
+        
+        println!("✅ Validation complete");
+        Ok(())
+    }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let tool = MultiTargetTool::new();
     
@@ -1038,7 +1485,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             tool.test(target)?;
         }
         Commands::Glue { command } => {
-            tool.handle_glue_command(command)?;
+            if let Err(e) = tool.handle_glue_command(command).await {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
         }
     }
     
