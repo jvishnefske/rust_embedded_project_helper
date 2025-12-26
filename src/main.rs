@@ -324,7 +324,9 @@ impl PackageInspector {
     }
 
     fn extract_trait_name_from_path(&self, path: &syn::Path) -> Option<String> {
-        path.segments.last().map(|segment| segment.ident.to_string())
+        path.segments
+            .last()
+            .map(|segment| segment.ident.to_string())
     }
 
     fn is_trait_native_mockable(&self, trait_name: &str) -> bool {
