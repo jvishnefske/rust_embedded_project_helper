@@ -324,11 +324,7 @@ impl PackageInspector {
     }
 
     fn extract_trait_name_from_path(&self, path: &syn::Path) -> Option<String> {
-        if let Some(segment) = path.segments.last() {
-            Some(segment.ident.to_string())
-        } else {
-            None
-        }
+        path.segments.last().map(|segment| segment.ident.to_string())
     }
 
     fn is_trait_native_mockable(&self, trait_name: &str) -> bool {
@@ -721,7 +717,7 @@ defmt = "0.3"
 
     fn create_core_lib(&self, project_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         let core_lib_path = project_path.join("core-lib");
-        fs::create_dir_all(&core_lib_path.join("src"))?;
+        fs::create_dir_all(core_lib_path.join("src"))?;
 
         // Create Cargo.toml for core-lib
         let cargo_content = r#"[package]
@@ -983,7 +979,7 @@ multi-target-rs build --target stm32
         hal: &Option<String>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let hal_path = self.project_root.join(format!("hal-{}", platform));
-        fs::create_dir_all(&hal_path.join("src"))?;
+        fs::create_dir_all(hal_path.join("src"))?;
 
         let hal_crate = hal.as_ref().map(|h| h.as_str()).unwrap_or("stm32f4xx-hal");
 
@@ -1053,7 +1049,7 @@ impl<P: OutputPin> LedController for {}Led<P> {{
         target: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let app_path = self.project_root.join(format!("app-{}", platform));
-        fs::create_dir_all(&app_path.join("src"))?;
+        fs::create_dir_all(app_path.join("src"))?;
 
         // Determine if we need panic handler and allocator based on target
         let is_embedded =
@@ -1490,12 +1486,9 @@ fn main() -> ! {{
             println!("  ✓ Updated existing platform configuration");
         } else {
             // Extract crate name from source
-            let hal_crate =
-                if let Some(captures) = regex::Regex::new(r"/([^/]+)$")?.captures(&source) {
-                    Some(captures[1].to_string())
-                } else {
-                    None
-                };
+            let hal_crate = regex::Regex::new(r"/([^/]+)$")?
+                .captures(&source)
+                .map(|captures| captures[1].to_string());
 
             config.platforms.push(Platform {
                 name: platform.clone(),
