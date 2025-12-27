@@ -1,149 +1,71 @@
 # Multi-Target Rust Project Tool
 
-A command-line utility for creating and managing **cross-platform, native-testable Rust projects** with clean separation of hardware-agnostic logic, hardware abstraction layers, and platform-specific binaries.  
+Scaffold and manage cross-platform, native-testable Rust embedded projects with a single CLI. Write hardware-agnostic logic once, test locally with mocks, and cross-compile to any target without manual Cargo.toml editing.
 
-This tool solves the problem of scaling embedded Rust projects from a simple single-crate demo to a **production-ready, multi-crate Cargo workspace** — enabling:
-- ⚡ **Native host-based testing** (fast unit tests with mocks)
-- 🔌 **Hardware abstraction via `embedded-hal`**
-- 🛠 **Cross-compilation for multiple targets** (e.g. STM32, ESP32, desktop)
-- 🚀 **Minimal dependencies until needed** (no HALs required unless added)
-
----
-
-## ✨ Features
-- `init` → Scaffold a new multi-crate workspace (`core-lib`, tests, configs).
-- `add-platform` → Add a target platform with HAL + binary glue crate.
-- `build` → Build for host or specific target (via Cargo or Cross).
-- `test` → Run fast, native unit tests using mocks.
-- `glue configs` → Manage validated platform configurations without editing text files manually.
-- CI/CD friendly (optional GitHub Actions workflow scaffold).
-
----
-
-## 📦 Installation
-```bash
-cargo install multi-target-rs
-````
-
-(Replace `multi-target-rs` with the actual crate name once published.)
-
----
-
-## 🚀 Quick Start
-
-### 1. Initialize a new project
+## Quick Start
 
 ```bash
-tool init myproj
+cargo install --path .
+multi-target-rs init myproj && cd myproj
+multi-target-rs test
+multi-target-rs add-platform stm32 --target thumbv7em-none-eabi
+```
+
+## Overview
+
+This tool solves the problem of scaling embedded Rust projects from a simple single-crate demo to a production-ready, multi-crate Cargo workspace. It enables:
+
+- Native host-based testing with `embedded-hal-mock`
+- Hardware abstraction via `embedded-hal` traits
+- Cross-compilation for multiple targets (STM32, ESP32, nRF, desktop)
+- Minimal dependencies until needed (no HALs required unless added)
+- CI/CD friendly workflow scaffolding
+
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `init <project-name>` | Initialize new project with workspace, core-lib, and tests |
+| `add-platform <name> --target <triple>` | Add a target platform with HAL + binary crate |
+| `list-platforms` | Show registered platforms and their target triples |
+| `build [--target <name>]` | Build for host or specific target |
+| `test [--target <name>]` | Run tests on host or target hardware |
+| `glue init <platform> <url>` | Initialize glue config from GitHub HAL repository |
+| `glue list` | List configured platforms with trait analysis |
+| `glue validate` | Validate configurations and HAL compatibility |
+
+## Project Structure
+
+After initialization, your project contains:
+
+```
+myproj/
+  Cargo.toml          # Workspace manifest
+  glue.toml           # Platform and HAL configuration
+  .cargo/config.toml  # Build defaults
+  core-lib/           # Hardware-agnostic business logic (#[no_std])
+  tests/              # Host-based unit tests with mocks
+  hal-<platform>/     # HAL wrapper crates (added via add-platform)
+  app-<platform>/     # Platform-specific binaries (added via add-platform)
+```
+
+## Example Workflow
+
+```bash
+# Create and test locally
+multi-target-rs init myproj
 cd myproj
+multi-target-rs test              # Run unit tests with mocks
+
+# Add embedded target
+multi-target-rs add-platform stm32 --target thumbv7em-none-eabi
+multi-target-rs build --target stm32
+
+# Inspect HAL package for trait compatibility
+multi-target-rs glue init stm32f4 https://github.com/stm32-rs/stm32f4xx-hal
+multi-target-rs glue list
 ```
-
-Creates a Cargo workspace with:
-
-* `core-lib/` (hardware-agnostic logic, `#[no_std]`)
-* `tests/` (native host-based tests with mocks)
-* `.cargo/config.toml` (minimal defaults)
-
----
-
-### 2. Run unit tests on host
-
-```bash
-tool test
-```
-
-Runs template unit tests using `embedded-hal-mock`.
-✅ Works out of the box — no hardware required.
-
----
-
-### 3. Add a hardware platform
-
-```bash
-tool add-platform stm32 --target thumbv7em-none-eabi
-```
-
-Scaffolds:
-
-* `hal-stm32/` (HAL wrapper crate)
-* `app-stm32/` (platform-specific binary)
-* Updates workspace `Cargo.toml`
-
----
-
-### 4. Build for specific targets
-
-```bash
-tool build --target stm32
-```
-
-* Uses `cross` (if available) or `cargo build`
-* Ensures correct toolchain/linker setup from `glue.toml`
-
----
-
-### 5. Run tests on target hardware
-
-```bash
-tool test --target stm32
-```
-
-Uses [`probe-rs`](https://github.com/probe-rs/probe-rs) + [`embedded-test`](https://github.com/probe-rs/embedded-test) for flashing & test execution on device.
-
----
-## 🧩 Commands
-
-```bash
-tool init <project-name>        # Initialize new project
-tool add-platform <name> --target <triple>
-tool list-platforms             # Show added platforms
-tool build [--target <name>]    # Build for host or target
-tool test [--target <name>]     # Run tests on host or target
-```
-
----
-
-## 📖 Example Workflow
-
-```bash
-# Create new project
-tool init myproj
-cd myproj
-
-# Verify native tests work
-tool test
-
-# Add STM32 platform
-tool add-platform stm32 --target thumbv7em-none-eabi
-
-# Build for STM32
-tool build --target stm32
-
-# Run on hardware
-tool test --target stm32
-```
-
----
-
-## 🛠 Extensibility
-
-* Add custom templates for new boards.
-* Generate CI/CD pipelines (`.github/workflows`).
-* Integrates seamlessly with `defmt`, `probe-rs`, and `cross`.
-
----
-
-## 🔮 Roadmap
-
-* [ ] Expand template library (ESP32, nRF, RP2040, RISC-V).
-* [ ] Add config wizard for common toolchains.
-* [ ] Support mixed-language crates (Rust + C/C++).
-* [ ] Automatic integration with `cargo-generate`.
-
----
 
 ## License
 
-MIT or BSD
-
-
+MIT OR Apache-2.0
